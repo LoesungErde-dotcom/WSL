@@ -18,8 +18,11 @@ MAGIC = magic.Magic()
 X64_ELF_MAGIC = re.compile('^ELF 64-bit.* x86-64, version 1')
 ARM64_ELF_MAGIC = re.compile('^ELF 64-bit.* ARM aarch64, version 1')
 
+KNOWN_TAR_FORMATS = {'^XZ compressed data.*': True, '^gzip compressed data.*': True}
+
 DISCOURAGED_SYSTEM_UNITS = ['systemd-resolved.service',
                             'systemd-networkd.service',
+                            'systemd-networkd-wait-online.service',
                             'systemd-tmpfiles-setup.service',
                             'systemd-tmpfiles-clean.service',
                             'systemd-tmpfiles-setup-dev-early.service',
@@ -155,7 +158,7 @@ def read_config_keys(config: configparser.ConfigParser) -> dict:
 
     for section in config.sections():
         for key in config[section].keys():
-            keys[f'{section}.{key}'] = config[section][key]
+            keys[f'{section}.{key.lower()}'] = config[section][key]
 
     return keys
 
@@ -207,7 +210,10 @@ def read_systemd_enabled_units(flavor: str, name: str, tar) -> dict:
         if not info.issym():
             return unit_path
         else:
-            return info.linkpath
+            if info.linkpath.startswith('/'):
+                return get_tar_file(tar, linux_real_path(info.linkpath), follow_symlink=True)[1]
+            else:
+                return get_tar_file(tar, linux_real_path(os.path.dirname(unit_path) + '/' + info.linkpath), follow_symlink=True)[1]
 
     def list_directory(path: str):
         files = []
@@ -219,6 +225,17 @@ def read_systemd_enabled_units(flavor: str, name: str, tar) -> dict:
 
         return files
 
+    def is_dev_null(path: str) -> bool:
+        return path == './dev/null' or path == '/dev/null'
+
+    def is_masked(unit: str):
+        try:
+            target = link_target(f'/etc/systemd/system/{unit}')
+        except KeyError:
+            return False # No symlink found, unit is not masked
+
+        return is_dev_null(target)
+
     units = {}
     for config_dir in config_dirs:
         targets = [e for e in list_directory(config_dir) if e.endswith('.target.wants')]
@@ -226,17 +243,41 @@ def read_systemd_enabled_units(flavor: str, name: str, tar) -> dict:
         for target in targets:
             for e in list_directory(f'{config_dir}/{target}'):
                 fullpath = f'{config_dir}/{target}/{e}'
+
                 unit_target = link_target(fullpath)
 
-                if unit_target != '/dev/null':
+                if is_dev_null(unit_target) and not is_masked(e):
                     units[e] = fullpath
 
     return units
 
+# Manually implemented because os.path.realpath tries to resolve local symlinks
+def linux_real_path(path: str):
+    components = path.split('/')
 
-def get_tar_file(tar, path: str, follow_symlink=False):
+    result = []
+    for e in components:
+        if e == '.' or not e:
+            continue
+        elif e == '..':
+            if result:
+                del result[-1]
+            continue
 
-    # Tar members can be formated as /{path}, {path}, or ./{path}
+        result.append(e)
+
+    real_path = '/'.join(result)
+    if path and path[0] == '/':
+        return '/' + real_path
+    else:
+        return real_path
+
+def get_tar_file(tar, path: str, follow_symlink=False, symlink_depth=10):
+    if symlink_depth < 0:
+        print(f'Warning: Exceeded maximum symlink depth when reading: {path}')
+        return None, None
+
+    # Tar members can be formatted as /{path}, {path}, or ./{path}
     if path.startswith('/'):
         paths = [path, '.' + path, path[1:]]
     elif path.startswith('./'):
@@ -247,9 +288,9 @@ def get_tar_file(tar, path: str, follow_symlink=False):
     def follow_if_symlink(info, path: str):
         if follow_symlink and info.issym():
             if info.linkpath.startswith('/'):
-                return get_tar_file(tar, info.linkpath, follow_symlink=True)
+                return get_tar_file(tar, info.linkpath, follow_symlink=True, symlink_depth=symlink_depth - 1)
             else:
-                return get_tar_file(tar, f'{os.path.dirname(path)}/{info.linkpath}', follow_symlink=True)
+                return get_tar_file(tar, linux_real_path(os.path.dirname(path) + '/' + info.linkpath), follow_symlink=True, symlink_depth=symlink_depth -1)
         else:
             return info, path
 
@@ -268,9 +309,9 @@ def get_tar_file(tar, path: str, follow_symlink=False):
     parent_path = os.path.dirname(path)
     if parent_path != path:
         try:
-            parent_info, real_parent_path = get_tar_file(tar, parent_path, follow_symlink=True)
-            if real_parent_path != parent_path:
-                return get_tar_file(tar, f'{real_parent_path}/{os.path.basename(path)}', follow_symlink=True)
+            parent_info, real_parent_path = get_tar_file(tar, parent_path, follow_symlink=True, symlink_depth=symlink_depth - 1)
+            if real_parent_path is not None and real_parent_path != parent_path:
+                return get_tar_file(tar, f'{real_parent_path}/{os.path.basename(path)}', follow_symlink=True, symlink_depth=symlink_depth -1)
         except KeyError:
             pass
 
@@ -327,7 +368,7 @@ def read_tar(flavor: str, name: str, file, elf_magic: str):
 
             keys = read_config_keys(config)
 
-            unexpected_keys = [e for e in keys if e not in valid_keys]
+            unexpected_keys = [e for e in keys if e.lower() not in valid_keys]
             if unexpected_keys:
                 error(flavor, name, f'Found unexpected_keys in "{path}": {unexpected_keys}')
             else:
@@ -337,7 +378,7 @@ def read_tar(flavor: str, name: str, file, elf_magic: str):
 
         defaultUid = None
         if validate_mode('/etc/wsl-distribution.conf', [oct(0o664), oct(0o644)], 0, 0):
-            config = validate_config('/etc/wsl-distribution.conf', ['oobe.command', 'oobe.defaultuid', 'shortcut.icon', 'oobe.defaultname', 'windowsterminal.profileTemplate'])
+            config = validate_config('/etc/wsl-distribution.conf', ['oobe.command', 'oobe.defaultuid', 'shortcut.icon', 'oobe.defaultname', 'windowsterminal.profiletemplate'])
 
             if oobe_command := config.get('oobe.command', None):
                 validate_mode(oobe_command, [oct(0o775), oct(0o755)], 0, 0)
@@ -380,7 +421,10 @@ def read_tar(flavor: str, name: str, file, elf_magic: str):
 
 def read_url(flavor: str, name: str, url: dict, elf_magic):
      hash = hashlib.sha256()
+     if not url['Url'].endswith('.wsl'):
+         warning(flavor, name, f'Url does not point to a .wsl file: {url["Url"]}')
 
+     tar_format = None
      if url['Url'].startswith('file://'):
          with open(url['Url'].replace('file:///', '').replace('file://', ''), 'rb') as fd:
             while True:
@@ -389,6 +433,9 @@ def read_url(flavor: str, name: str, url: dict, elf_magic):
                     break
 
                 hash.update(e)
+
+                if tar_format is None:
+                    tar_format = MAGIC.from_buffer(e)
 
             fd.seek(0, 0)
             read_tar(flavor, name, fd, elf_magic)
@@ -400,6 +447,9 @@ def read_url(flavor: str, name: str, url: dict, elf_magic):
                 for e in response.iter_content(chunk_size=4096 * 4096):
                     file.write(e)
                     hash.update(e)
+
+                    if tar_format is None:
+                        tar_format = MAGIC.from_buffer(e)
 
                 file.seek(0, 0)
                 read_tar(flavor, name, file, elf_magic)
@@ -418,7 +468,11 @@ def read_url(flavor: str, name: str, url: dict, elf_magic):
          else:
              click.secho(f'Hash for {url["Url"]} matches ({expected_sha})', fg='green')
 
-
+     known_format = next((value for key, value in KNOWN_TAR_FORMATS.items() if re.match(key, tar_format)), None)
+     if known_format is None:
+        error(flavor, name, f'Unknown tar format: {tar_format}')
+     elif not known_format:
+        warning(flavor, name, f'Tar format not supported by WSL1: {tar_format}')
 
 def error(flavor: str, distribution: str, message: str):
     global errors
@@ -432,7 +486,7 @@ def warning(flavor: str, distribution: str, message: str):
     global warnings
 
     message = f'{flavor}/{distribution}: {message}'
-    click.secho(f'Warning: {message}', fg='red')
+    click.secho(f'Warning: {message}', fg='yellow')
 
     warnings.append(message)
 if __name__ == "__main__":
